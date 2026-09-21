@@ -1,0 +1,175 @@
+Global:
+  device: gpu
+  epoch_num: 50
+  log_smooth_window: 20
+  print_batch_step: 20
+  output_dir: /data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/runs/svtrv2_s_m2_alpha_030_to_target
+  save_epoch_step: [0, 1]
+  eval_epoch_step: [0, 100000]
+  eval_batch_step: [0, 100000000]
+  cal_metric_during_train: True
+  pretrained_model: /data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/runs/svtrv2_s_m1_dual_order_s50/best_clean_dev_macro_cer.pth
+  checkpoints:
+  use_tensorboard: false
+  infer_img:
+  character_dict_path: &character_dict_path /home/data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/character_dict_hz_ug_kk_v1/character_dict.txt
+  max_text_length: &max_text_length 120
+  use_space_char: &use_space_char True
+  save_res_path: /data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/runs/svtrv2_s_m2_alpha_030_to_target/predicts.txt
+  use_amp: False
+  grad_clip_val: 5.0
+  project_name: svtrv2_s_m2_alpha_030_to_target
+  seed: 20260731
+  preprocess_protocol: P1_MSR_V3
+  sampler_protocol: RATIO_SAMPLER_DDP_BALANCED_V2
+  model_protocol: MULTISCRIPT_DUAL_ORDER_SGM_V1_M2_ALPHA_0_30
+  dual_order_data_protocol: P1_MSR_V3_DUAL_ORDER_V2
+  method_variant: m2
+  uyghur_ctc_order: visual
+  evaluation_branch: ctc
+
+Optimizer:
+  name: AdamW
+  lr: 0.00002500
+  weight_decay: 0.01
+  filter_bias_and_bn: True
+
+LRScheduler:
+  name: OneCycleLR
+  warmup_epoch: 2
+  cycle_momentum: False
+
+Architecture:
+  model_type: rec
+  algorithm: SVTRv2
+  Transform:
+  Encoder:
+    name: SVTRv2LNConvTwo33
+    use_pos_embed: False
+    dims: [96, 192, 384]
+    depths: [3, 6, 3]
+    num_heads: [3, 6, 12]
+    mixer: [['Conv','Conv','Conv'],['Conv','Conv','Conv','FGlobal','Global','Global'],['Global','Global','Global']]
+    local_k: [[5, 5], [5, 5], [-1, -1]]
+    sub_k: [[1, 1], [2, 1], [-1, -1]]
+    last_stage: false
+    feat2d: True
+  Decoder:
+    name: DualOrderGTCDecoder
+    infer_gtc: True
+    detach: False
+    use_script_adapter: False
+    use_local_direction: False
+    script_bottleneck_ratio: 4
+    gtc_decoder:
+      name: SMTRDecoder
+      num_layer: 1
+      ds: True
+      max_len: *max_text_length
+      next_mode: &next_mode True
+      sub_str_len: &sub_str_len 5
+    ctc_decoder:
+      name: RCTCDecoder
+
+Loss:
+  name: DualOrderGTCLoss
+  ctc_weight: 0.1
+  gtc_weight: 1.0
+  consistency_weight: 0.30
+  script_weight: 0.0
+  direction_weight: 0.0
+  consistency_temperature: 1.0
+  alignment_prior_scale: 0.75
+  zero_infinity: True
+  gtc_loss:
+    name: SMTRLoss
+
+PostProcess:
+  name: GTCLabelDecode
+  gtc_label_decode:
+    name: SMTRLabelDecode
+    next_mode: *next_mode
+  character_dict_path: *character_dict_path
+  use_space_char: *use_space_char
+
+Metric:
+  name: RecGTCMetric
+  main_indicator: acc
+  ignore_space: False
+  is_filter: False
+
+Train:
+  dataset:
+    name: RatioDataSetTVResize
+    ds_width: True
+    padding: False
+    base_shape: [[64,64],[96,48],[112,40],[128,32]]
+    base_h: 32
+    data_dir_list:
+      - /home/data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/msr_lmdb/P1_MSR_V3_DUAL_ORDER_V2/target_train
+    transforms:
+      - DecodeImagePIL:
+          img_mode: RGB
+      - DualOrderGTCLabelEncode:
+          ctc_order: visual
+          sgm_order: logical
+          gtc_label_encode:
+            name: SMTRLabelEncode
+            sub_str_len: 5
+          character_dict_path: *character_dict_path
+          use_space_char: *use_space_char
+          max_text_length: *max_text_length
+      - KeepKeys:
+          keep_keys: ['image', 'label', 'label_subs', 'label_next', 'length_subs', 'label_subs_pre', 'label_next_pre', 'length_subs_pre', 'length', 'visual_token_ids', 'logical_token_ids', 'logical_to_visual', 'visual_direction_ids', 'visual_script_ids', 'consistency_mask', 'ctc_label', 'ctc_length']
+  sampler:
+    name: RatioSampler
+    scales: [[128,32]]
+    first_bs: 16
+    fix_bs: False
+    divided_factor: [4,16]
+    is_training: True
+    max_ratio: 40
+  loader:
+    shuffle: True
+    batch_size_per_card: 16
+    drop_last: True
+    max_ratio: 40
+    num_workers: 4
+
+Eval:
+  dataset:
+    name: RatioDataSetTVResize
+    ds_width: True
+    padding: False
+    base_shape: [[64,64],[96,48],[112,40],[128,32]]
+    base_h: 32
+    data_dir_list:
+      - /home/data_home/wudayu/experiments/multilingual_meme_ocr/svtrv2_line_recognition/04_model_training/msr_lmdb/P1_MSR_V3_DUAL_ORDER_V2/target_dev
+    transforms:
+      - DecodeImagePIL:
+          img_mode: RGB
+      - DualOrderGTCLabelEncode:
+          ctc_order: visual
+          sgm_order: logical
+          gtc_label_encode:
+            name: SMTRLabelEncode
+            sub_str_len: 5
+          character_dict_path: *character_dict_path
+          use_space_char: *use_space_char
+          max_text_length: *max_text_length
+      - KeepKeys:
+          keep_keys: ['image', 'label', 'label_subs', 'label_next', 'length_subs', 'label_subs_pre', 'label_next_pre', 'length_subs_pre', 'length', 'visual_token_ids', 'logical_token_ids', 'logical_to_visual', 'visual_direction_ids', 'visual_script_ids', 'consistency_mask', 'ctc_label', 'ctc_length']
+  sampler:
+    name: RatioSampler
+    scales: [[128,32]]
+    first_bs: 16
+    fix_bs: False
+    divided_factor: [4,16]
+    is_training: False
+    max_ratio: 40
+  loader:
+    shuffle: False
+    batch_size_per_card: 16
+    drop_last: False
+    max_ratio: 40
+    num_workers: 4

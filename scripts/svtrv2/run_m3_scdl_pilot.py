@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Run the frozen target-only M3+SCDL pilot on Clean Dev V4."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+METHOD = "m3_scdl_pilot"
+TARGET_NAME = "svtrv2_s_m3_scdl_pilot_dual_order_s50_to_target"
+PROTOCOL_ID = "M3_SCDL_TARGET_ONLY_PILOT_CLEAN_DEV_V4_V1"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--m3-s50-checkpoint", type=Path, required=True)
+    parser.add_argument("--m3-profile", type=Path, required=True)
+    parser.add_argument("--v4-reselection-dir", type=Path, required=True)
+    parser.add_argument("--v4-protocol-dir", type=Path, required=True)
+    parser.add_argument(
+        "--v4-frozen-manifest",
+        default="frozen_clean_dev_v4_manifest.json",
+    )
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--resume-existing", action="store_true")
+    parser.add_argument("--replace", action="store_true")
+    return parser.parse_args()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def run(command: list[str], root: Path, log: Path | None = None) -> None:
+    print("+ " + " ".join(command), flush=True)
+    if log is None:
+        subprocess.run(command, cwd=str(root), check=True)
+        return
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            handle.write(line)
+        code = process.wait()
+    if code:
+        raise RuntimeError(f"Command failed ({code}); see {log}")
+
+
+def prepare(root: Path, source: Path, args: argparse.Namespace) -> Path:
+    run(
+        [
+            sys.executable,
+            str(root / "scripts/svtrv2/prepare_dual_order_method.py"),
+            "--root", str(root),
+            "--method", METHOD,
+            "--stage", "target",
+            "--source-checkpoint", str(source),
+            "--source-role", "frozen_M3_alpha015_S50_pretrained_checkpoint",
+            "--max-epoch", "50",
+            "--batch-size-per-card", str(args.batch_size),
+            "--control-world-size", "2",
+            "--control-first-batch-size", "16",
+            "--num-workers", str(args.num_workers),
+            "--lr", "2.5e-5",
+            "--seed", "20260731",
+        ],
+        root,
+        args.log_dir / "prepare.log",
+    )
+    return root / "04_model_training/configs" / f"{TARGET_NAME}.yml"
+
+
+def preflight(root: Path, config: Path, args: argparse.Namespace) -> dict:
+    run(
+        [
+            sys.executable,
+            str(root / "scripts/svtrv2/validate_dual_order_method_config.py"),
+            "--config", str(config),
+            "--expected-initialization", "checkpoint",
+        ],
+        root,
+        args.log_dir / "config_validation.log",
+    )
+    sampler_audit = args.log_dir / "sampler_audit.json"
+    run(
+        [
+            sys.executable,
+            str(root / "scripts/svtrv2/audit_p1_ratio_sampler_ddp.py"),
+            "--root", str(root),
+            "--config", str(config),
+            "--world-size", "1",
+            "--output", str(sampler_audit),
+        ],
+        root,
+        args.log_dir / "sampler_audit.log",
+    )
+    smoke = args.log_dir / "single_batch_smoke.json"
+    run(
+        [
+            sys.executable,
+            str(root / "scripts/svtrv2/smoke_dual_order_method.py"),
+            "--root", str(root),
+            "--config", str(config),
+            "--device-id", "0",
+            "--smoke-batch-size", "4",
+            "--require-full-initialization",
+            "--allow-new-scdl-parameters",
+            "--output", str(smoke),
+        ],
+        root,
+        args.log_dir / "single_batch_smoke.log",
+    )
+    payload = load_json(smoke)
+    if payload.get("status") != "DUAL_ORDER_REAL_BATCH_FORWARD_BACKWARD_OK":
+        raise RuntimeError(f"Failed SCDL smoke report: {smoke}")
+    fresh = payload["initialization_coverage"].get("fresh_parameter_keys", [])
+    if not fresh or any(not key.startswith("decoder.scdl.") for key in fresh):
+        raise ValueError(f"Invalid fresh SCDL state audit: {fresh[:20]}")
+    if payload["gradient_groups"].get("scdl", 0) <= 0:
+        raise ValueError("No gradient reached the SCDL projection in smoke test")
+    if payload["losses"].get("scdl_active_weight") != 0.05:
+        raise ValueError("SCDL smoke did not exercise the active post-warmup loss")
+    if payload["losses"].get("scdl_valid_tokens", 0) <= 0:
+        raise ValueError("SCDL smoke found no same-script hard-confusion tokens")
+    return {
+        "config": str(config),
+        "config_sha256": sha256(config),
+        "sampler_audit": str(sampler_audit),
+        "sampler_audit_sha256": sha256(sampler_audit),
+        "smoke": str(smoke),
+        "smoke_sha256": sha256(smoke),
+        "fresh_scdl_state_keys": fresh,
+    }
+
+
+def train(root: Path, config: Path, args: argparse.Namespace) -> dict:
+    command = [
+        sys.executable,
+        str(root / "scripts/svtrv2/run_p1_rctc_stage.py"),
+        "--root", str(root),
+        "--stage", TARGET_NAME,
+        "--config", str(config),
+        "--run-dir", str(root / "04_model_training/runs" / TARGET_NAME),
+        "--labels-dir", str(root / "04_model_training/datasets/e1_target_only/labels"),
+        "--label-prefix", "target",
+        "--eval-prefix", TARGET_NAME,
+        "--expected-initialization", "checkpoint",
+        "--config-kind", "dual_order",
+        "--prediction-branch", "ctc",
+        "--max-epoch", "50",
+        "--eval-every", "2",
+        "--patience-evals", "5",
+        "--min-epoch", "10",
+        "--min-delta", "0.0001",
+        "--ddp-gpus", str(args.gpu),
+        "--eval-gpu", str(args.gpu),
+        "--master-port", "29943",
+        "--log-dir", str(args.log_dir),
+        "--selection-protocol-dir", str(args.v4_protocol_dir),
+        "--selection-frozen-manifest", args.v4_frozen_manifest,
+        "--selection-protocol-label", "Clean Dev V4",
+    ]
+    if args.replace:
+        command.append("--replace")
+    elif args.resume_existing:
+        command.append("--resume-existing")
+    run(command, root, args.log_dir / "formal.log")
+    summary = (
+        root / "04_model_training/eval_reports" / f"{TARGET_NAME}_final_summary.json"
+    )
+    if not summary.is_file():
+        raise FileNotFoundError(summary)
+    return load_json(summary)
+
+
+def summarize(root: Path, profile_path: Path, pilot: dict, binding: dict) -> dict:
+    profile = load_json(profile_path)
+    baseline = {
+        **profile["metrics"]["macro"],
+        "languages": profile["metrics"]["languages"],
+    }
+    candidate = pilot["dev"]
+    rows = []
+    for name, metrics in (("M3_alpha015", baseline), ("M3_plus_SCDL_pilot", candidate)):
+        row = {
+            "model": name,
+            "macro_cer": metrics.get("macro_cer", metrics.get("cer")),
+            "macro_wer": metrics.get("macro_wer", metrics.get("wer")),
+            "macro_one_minus_ned": metrics.get(
+                "macro_one_minus_ned", metrics.get("one_minus_ned")
+            ),
+            "macro_line_accuracy": metrics.get(
+                "macro_line_accuracy", metrics.get("line_accuracy")
+            ),
+        }
+        for language in ("zh", "ug", "kk"):
+            row[f"{language}_cer"] = metrics["languages"][language]["cer"]
+            row[f"{language}_line_accuracy"] = metrics["languages"][language][
+                "line_accuracy"
+            ]
+        rows.append(row)
+
+    deltas = {
+        key: float(rows[1][key]) - float(rows[0][key])
+        for key in rows[0]
+        if key != "model"
+    }
+    improvement_pp = -deltas["macro_cer"] * 100.0
+    improved_languages = [
+        language
+        for language in ("zh", "ug", "kk")
+        if deltas[f"{language}_cer"] < 0
+    ]
+    primary_pass = deltas["macro_cer"] < 0
+    mechanism_pass = len(improved_languages) >= 2
+    cer_safety = all(
+        deltas[f"{language}_cer"] <= 0.001
+        for language in ("zh", "ug", "kk")
+    )
+    line_safety = all(
+        deltas[f"{language}_line_accuracy"] >= -0.005
+        for language in ("zh", "ug", "kk")
+    )
+    if not primary_pass or not cer_safety or not line_safety:
+        decision = "PILOT_REJECTED"
+        next_action = "stop_SCDL_without_hyperparameter_search"
+    elif improvement_pp < 0.02:
+        decision = "WEAK_POSITIVE_REQUIRES_SECOND_TARGET_SEED"
+        next_action = "run_one_additional_target_seed_before_any_full_S50_training"
+    elif not mechanism_pass:
+        decision = "NUMERIC_GAIN_WITHOUT_MULTISCRIPT_MECHANISM_SUPPORT"
+        next_action = "blind_error_review_before_any_additional_training"
+    else:
+        decision = "PROMISING_REQUIRES_BLIND_REVIEW_AND_SECOND_TARGET_SEED"
+        next_action = (
+            "blindly_review_hard_confusions_then_run_second_target_seed; "
+            "authorize_full_S50_to_target_only_if_both_support_SCDL"
+        )
+
+    output_dir = root / "05_evaluation/m3_scdl_target_only_pilot_clean_dev_v4"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "comparison.csv").open(
+        "w", encoding="utf-8-sig", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    result = {
+        "status": "M3_SCDL_TARGET_ONLY_PILOT_COMPLETE",
+        "protocol_id": PROTOCOL_ID,
+        "experiment_class": "exploratory_pilot_not_formal_main_table",
+        "selection_metric": "Clean Dev V4 Macro CER",
+        "models": rows,
+        "candidate_minus_m3": deltas,
+        "macro_cer_improvement_percentage_points": improvement_pp,
+        "improved_language_cer": improved_languages,
+        "guardrails": {
+            "primary_macro_cer_improved": primary_pass,
+            "at_least_two_language_cer_improved": mechanism_pass,
+            "no_language_cer_worse_by_more_than_0.10pp": cer_safety,
+            "no_language_line_accuracy_worse_by_more_than_0.5pp": line_safety,
+            "clear_positive_threshold": "Macro CER improvement >= 0.02 percentage points",
+        },
+        "decision": decision,
+        "next_action": next_action,
+        "binding": binding,
+        "corrupted_dev_used": False,
+        "test_evaluated": False,
+    }
+    (output_dir / "pilot_summary.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
+
+
+def main() -> None:
+    args = parse_args()
+    if args.replace and args.resume_existing:
+        raise ValueError("--replace and --resume-existing cannot be combined")
+    if args.batch_size != 32:
+        raise ValueError(
+            "SCDL pilot freezes global batch size at 32 to match M3; "
+            f"got {args.batch_size}"
+        )
+    root = args.root.resolve()
+    args.log_dir = args.log_dir.resolve()
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    args.m3_s50_checkpoint = args.m3_s50_checkpoint.resolve()
+    args.m3_profile = args.m3_profile.resolve()
+    args.v4_reselection_dir = args.v4_reselection_dir.resolve()
+    args.v4_protocol_dir = args.v4_protocol_dir.resolve()
+    decisions_path = args.v4_reselection_dir / "final_decisions.json"
+    v4_manifest = args.v4_protocol_dir / args.v4_frozen_manifest
+    for path in (
+        args.m3_s50_checkpoint,
+        args.m3_profile,
+        decisions_path,
+        v4_manifest,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+    profile = load_json(args.m3_profile)
+    decisions = load_json(decisions_path)
+    if profile.get("status") != "CLEAN_DEV_V4_M3_ERROR_PROFILE_READY":
+        raise ValueError("SCDL pilot requires the frozen Clean Dev V4 M3 profile")
+    if profile.get("alpha") != 0.15 or profile.get("selected_epoch") != 34:
+        raise ValueError("SCDL pilot requires frozen M3 alpha=.15 at epoch 34")
+    if profile.get("test_evaluated") is not False:
+        raise ValueError("M3 profile violates Test isolation")
+    alpha = decisions.get("alpha_selection", {})
+    scale = decisions.get("scale_selection", {})
+    if alpha.get("selected_alpha") != 0.15 or alpha.get("selected_model") != "M3_alpha015":
+        raise ValueError("Clean Dev V4 does not freeze M3 alpha=.15")
+    if scale.get("selected_scale") != "S50":
+        raise ValueError("Clean Dev V4 does not freeze S50")
+    if decisions.get("test_evaluated") is not False:
+        raise ValueError("Clean Dev V4 decisions violate Test isolation")
+
+    original_prepare_path = (
+        root / "04_model_training/datasets/m3_dual_order_s50_to_target/prepare_summary.json"
+    )
+    if not original_prepare_path.is_file():
+        raise FileNotFoundError(original_prepare_path)
+    original_prepare = load_json(original_prepare_path)
+    expected_hash = original_prepare.get("source_checkpoint_sha256")
+    actual_hash = sha256(args.m3_s50_checkpoint)
+    if actual_hash != expected_hash:
+        raise ValueError(
+            "SCDL pilot initialization differs from frozen M3 target initialization: "
+            f"expected={expected_hash}, actual={actual_hash}"
+        )
+
+    binding = {
+        "protocol_id": PROTOCOL_ID,
+        "classification": "exploratory_target_only_pilot",
+        "hypothesis": (
+            "M3 visual features contain useful glyph evidence but need stronger "
+            "same-script character discrimination"
+        ),
+        "m3_s50_checkpoint": str(args.m3_s50_checkpoint),
+        "m3_s50_checkpoint_sha256": actual_hash,
+        "frozen_m3_target_prepare": str(original_prepare_path),
+        "frozen_m3_target_prepare_sha256": sha256(original_prepare_path),
+        "m3_profile": str(args.m3_profile),
+        "m3_profile_sha256": sha256(args.m3_profile),
+        "v4_manifest": str(v4_manifest),
+        "v4_manifest_sha256": sha256(v4_manifest),
+        "v4_final_decisions": str(decisions_path),
+        "v4_final_decisions_sha256": sha256(decisions_path),
+        "synthetic_scale": "S50 checkpoint reused; no synthetic retraining in pilot",
+        "alpha": 0.15,
+        "scdl_weight": 0.05,
+        "scdl_topk": 5,
+        "scdl_temperature": 0.1,
+        "scdl_warmup_fraction": 0.2,
+        "alignment": (
+            "exact batched CTC forward-backward token posterior with detached "
+            "routing; adjacent-repeat samples conservatively excluded"
+        ),
+        "character_pooling": "posterior-weighted RCTC frame features",
+        "negative_mining": "online top-k populated prototypes within the same Unicode script",
+        "script_balance": "(Han + Arabic + Cyrillic) / 3; common characters excluded",
+        "prototype_update": "checkpointed cumulative mean; no momentum hyperparameter",
+        "inference_path": "identical to M3; SCDL outputs are training-only",
+        "seed": 20260731,
+        "global_batch_size": args.batch_size,
+        "only_changed_factor": "add training-only SCDL objective to frozen M3 recipe",
+        "corrupted_dev_used": False,
+        "test_evaluated": False,
+    }
+    binding_path = args.log_dir / "study_binding.json"
+    if binding_path.is_file():
+        if load_json(binding_path) != binding:
+            raise ValueError("SCDL pilot binding changed during resume")
+    else:
+        binding_path.write_text(
+            json.dumps(binding, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    config = prepare(root, args.m3_s50_checkpoint, args)
+    preflight_report = preflight(root, config, args)
+    if args.preflight_only:
+        print(
+            json.dumps(
+                {
+                    "status": "M3_SCDL_TARGET_ONLY_PILOT_PREFLIGHT_OK",
+                    "protocol_id": PROTOCOL_ID,
+                    "preflight": preflight_report,
+                    "binding": binding,
+                    "formal_training_started": False,
+                    "test_evaluated": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    pilot = train(root, config, args)
+    summarize(root, args.m3_profile, pilot, binding)
+
+
+if __name__ == "__main__":
+    main()

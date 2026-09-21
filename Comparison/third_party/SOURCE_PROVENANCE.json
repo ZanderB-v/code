@@ -1,0 +1,54 @@
+{
+  "manifest_version": "pretrained_baseline_source_provenance_v1",
+  "sources": {
+    "parseq_model_hub": {
+      "repository": "https://github.com/baudm/parseq",
+      "release": "v1.0.0",
+      "local_path": "Comparison/third_party/parseq_v1_0_0",
+      "licenses": {
+        "LICENSE": {
+          "identifier": "Apache-2.0",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        },
+        "strhub/models/crnn/LICENSE": {
+          "identifier": "MIT",
+          "sha256": "ca3d53e04088c5752274d53d981c321db6f962a8d6740fcde7d1a0789532d1f8"
+        },
+        "strhub/models/abinet/LICENSE": {
+          "identifier": "BSD-3-Clause-derived",
+          "sha256": "1a9fef14b4e657458b67479648ec427d0b431ddbfa9c8fba17398a43f625ff9c"
+        }
+      },
+      "key_source_files": {
+        "strhub/models/abinet/__init__.py": "46f6345de9ec3928050e77e6ad39c847f0eca0c902f54c875de5b07cb297c1aa",
+        "strhub/models/abinet/attention.py": "b7cb52812a0fb469de44508743b0ba983bd35806f18586bf9e851ad51c7823f8",
+        "strhub/models/abinet/backbone.py": "849208173a39431a06309714a3fde1799e945554bf0aa7340a2667a0df946d22",
+        "strhub/models/abinet/model.py": "7b7518d6815802bb4d1c614e3f91f313f58d8033f0258a7bfeff6a44c666933e",
+        "strhub/models/abinet/model_alignment.py": "96c292b70c2b2f5a2a40325bcc377ade4ac35c1fc38a5da71a8aa42cd9d9b8fa",
+        "strhub/models/crnn/model.py": "7c554cf0b854333b91d6ba0fcc9c2b6fa9d8d244d0380d999e503e170ea48a0a",
+        "strhub/models/parseq/modules.py": "f9319cbd780e1bcf6fa7adc03bb2f5119ea276884b496bc57d2e90170d303584",
+        "strhub/models/abinet/model_abinet_iter.py": "37a59e1f719e534b4ce085087db108a267e5294af65ddb0c7643a16f798975d5",
+        "strhub/models/abinet/model_language.py": "b9e69ab83b6a149ecd4ddfb34f0f1c3914f90fb0018ec69a034e76603a0b8c53",
+        "strhub/models/abinet/model_vision.py": "cd27368f38d9a28eb5c38db0e0e289c43643621185d9a349d4807b6991bdbbb7",
+        "strhub/models/abinet/resnet.py": "f13be36b82fdf833dbcbb3cc59b8e9581f1d69da42c208c5c64522d7bc19a1f9",
+        "strhub/models/abinet/system.py": "5b211adf7f891836a96f5ca09eba665bb77563f6bb98281a202cd5c55eaf4acf",
+        "strhub/models/abinet/transformer.py": "127412d410f7354593373ed5ea6c81022bffcd3d6e47471656fa32b98f1e8226"
+      }
+    },
+    "mmocr": {
+      "repository": "https://github.com/open-mmlab/mmocr",
+      "release": "v1.0.1",
+      "local_path": "Comparison/third_party/mmocr_v1_0_1",
+      "licenses": {
+        "LICENSE": {
+          "identifier": "Apache-2.0",
+          "sha256": "22fb270ecf524d0d957581cb7301c5109e0f4502cd0fdd24c96a0972bb136da4"
+        }
+      },
+      "key_source_files": {
+        "mmocr/models/textrecog/encoders/svtr_encoder.py": "689ab9e92a71deacd1abba1fb25e67564d9f435bba166102eea8c04fb0984726",
+        "mmocr/models/textrecog/preprocessors/tps_preprocessor.py": "84e4b0559d69cbb9bd6e42db5acada750dd159ce9d176677fcedb1726ae138ac"
+      }
+    }
+  }
+}
